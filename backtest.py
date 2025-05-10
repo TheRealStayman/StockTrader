@@ -1,280 +1,238 @@
 # backtest.py
-
 import backtrader as bt
+import backtrader.analyzers as btanalyzers
 import pandas as pd
-import numpy as np
 import joblib
-import os
 import logging
-from datetime import datetime
+import os
 
-# Import functions/classes from other modules
-from data_loader import load_stock_data, load_gdelt_data, load_stock_info  # For potential re-run/verification
-from feature_engineering import load_processed_data  # Primarily use this
-from trading_strategy import MLTradingStrategy  # Import the strategy
+# Import from local modules
+from utils import load_processed_data, load_model_artefacts, PandasDataWithFeatures, FixedFractionPortfolioSizer
+from trading_strategy import MLTradingStrategy
 
-# --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- Paths ---
-PROCESSED_DATA_PATH = './processed_data/final_features.parquet'  # Input data for backtesting
-MODEL_PATH = './models/gdelt_stock_model.joblib'  # Input trained model
-STOCK_INFO_PATH = 'path/to/your/stock_info.csv'  # Needed to get the list of tickers if not inferred from data
+# --- Default Configuration (can be overridden by a calling script) ---
+# These paths would typically be passed in or read from a config if this script is run standalone.
+DEFAULT_PROCESSED_DATA_PATH = './processed_data/final_features.parquet'
+DEFAULT_MODEL_PATH = './models/gdelt_stock_model.joblib'
+DEFAULT_FEATURES_PATH = './models/gdelt_stock_model_features.joblib'
+# DEFAULT_STOCK_INFO_PATH = 'data/Stock Information.csv' # User specified path
 
-# --- Backtesting Parameters ---
-INITIAL_CASH = 100000.0
-COMMISSION_PER_TRADE = 0.001  # Example: 0.1% commission
-SLIPPAGE_PERCENT = 0.0005  # Example: 0.05% slippage (adjust based on broker/market)
-POSITION_SIZE_PERCENT = 5.0  # Max % of portfolio value per trade
+DEFAULT_INITIAL_CASH = 100000.0
+DEFAULT_COMMISSION_PER_TRADE = 0.001
+DEFAULT_SLIPPAGE_PERCENT = 0.0005
+DEFAULT_POSITION_SIZE_PERCENT = 5.0  # Max % of portfolio value per trade
+DEFAULT_BUY_THRESHOLD = 0.55
+DEFAULT_SELL_THRESHOLD = 0.45
 
-# Optional: Define a specific backtest period (if None, uses all data in the file)
-# Ensure this period corresponds to the test set used during training or a separate hold-out period
-BACKTEST_START_DATE = None  # e.g., '2022-01-01'
-BACKTEST_END_DATE = None  # e.g., '2023-12-31'
 
-# --- Load Model and Data ---
+def run_backtest(processed_data_path=DEFAULT_PROCESSED_DATA_PATH,
+                 model_path=DEFAULT_MODEL_PATH,
+                 features_path=DEFAULT_FEATURES_PATH,
+                 initial_cash=DEFAULT_INITIAL_CASH,
+                 commission=DEFAULT_COMMISSION_PER_TRADE,
+                 slippage_perc=DEFAULT_SLIPPAGE_PERCENT,
+                 position_sizer_perc=DEFAULT_POSITION_SIZE_PERCENT,
+                 buy_threshold=DEFAULT_BUY_THRESHOLD,
+                 sell_threshold=DEFAULT_SELL_THRESHOLD,
+                 backtest_start_date=None,  # e.g., '2022-01-01'
+                 backtest_end_date=None,  # e.g., '2023-12-31'
+                 plot_results=True):
+    """
+    Runs a backtest with the given parameters.
+    """
+    logger.info("--- Starting Backtest via run_backtest function ---")
 
-# Load the trained model pipeline
-try:
-    model_pipeline = joblib.load(MODEL_PATH)
-    logging.info(f"Model pipeline loaded successfully from {MODEL_PATH}")
-    # Extract feature names from the preprocessor step if possible
-    # This assumes a ColumnTransformer named 'preprocessor' with a transformer named 'num'
-    try:
-        # If using ColumnTransformer with named transformers:
-        preprocessor_step = model_pipeline.named_steps['preprocessor']
-        # Find the numeric transformer to get feature names after potential imputation/scaling
-        numeric_transformer = next((item[1] for item in preprocessor_step.transformers_ if item[0] == 'num'), None)
-        if numeric_transformer and hasattr(numeric_transformer, 'get_feature_names_out'):
-            # If StandardScaler was used, feature names might be lost, rely on pre-defined list
-            # A better approach is to save the feature list used during training alongside the model
-            logging.warning(
-                "Attempting to get feature names from pipeline - might be unreliable. Ensure 'feature_cols' below is correct.")
-            # feature_columns = numeric_transformer.get_feature_names_out() # This might not work depending on pipeline structure
-            # Manually define based on feature_engineering.py output if needed
-            # feature_columns = [...] # Define explicitly here or load from a saved file
-        elif 'classifier' in model_pipeline.named_steps and hasattr(model_pipeline.named_steps['classifier'],
-                                                                    'feature_name_'):
-            # For models like LightGBM that store feature names after fitting the pipeline
-            feature_columns = model_pipeline.named_steps['classifier'].feature_name_
-            logging.info(f"Extracted {len(feature_columns)} feature names from the model.")
+    # 1. Load Model and Feature List
+    model_pipeline, feature_columns = load_model_artefacts(model_path, features_path)
+    if model_pipeline is None:
+        logger.error("Model could not be loaded. Aborting backtest.")
+        return None
+    if feature_columns is None:
+        logger.warning("Feature columns not loaded. Attempting to infer or assuming they are correctly in data.")
+        # This scenario should be handled carefully; model needs specific features.
+
+    # 2. Load Processed Data for Backtesting
+    all_feature_data = load_processed_data(processed_data_path)
+    if all_feature_data is None or all_feature_data.empty:
+        logger.error("Failed to load processed data for backtesting. Aborting.")
+        return None
+
+    # Ensure feature_columns are present in the loaded data if not None
+    if feature_columns:
+        missing_model_features = [fc for fc in feature_columns if fc not in all_feature_data.columns]
+        if missing_model_features:
+            logger.error(
+                f"Processed data is missing columns required by the model: {missing_model_features}. Aborting.")
+            return None
+    else:  # If feature_columns could not be loaded, we must infer them (less safe)
+        logger.warning("Feature columns for the model were not loaded; inferring from data. This is risky.")
+        # Define default exclusions for inferring features if feature_columns is None
+        cols_to_exclude = [
+            'Open', 'High', 'Low', 'Close', 'Volume', 'Target', 'Ticker',
+            'GLOBALEVENTID', 'SQLDATE', 'Actor1Name', 'Actor2Name', 'SOURCEURL', 'Title From URL',
+            'CompanyName', 'Sector', 'Industry', 'CompanyName_Clean', 'openinterest'
+        ]
+        feature_columns = [col for col in all_feature_data.columns if col not in cols_to_exclude]
+        if not feature_columns:
+            logger.error("Could not infer any feature columns from the data. Aborting.")
+            return None
+        logger.info(f"Inferred {len(feature_columns)} feature columns for the backtest.")
+
+    # 3. Setup Cerebro
+    cerebro = bt.Cerebro(stdstats=False, cheat_on_open=True)  # cheat_on_open allows using Open for execution
+
+    # 4. Add Strategy
+    cerebro.addstrategy(MLTradingStrategy,
+                        model=model_pipeline,
+                        feature_cols=feature_columns,
+                        buy_threshold=buy_threshold,
+                        sell_threshold=sell_threshold,
+                        printlog=True)
+
+    # 5. Prepare and Add Data Feeds
+    logger.info("Preparing and adding data feeds to Cerebro...")
+
+    # Filter data by date if specified
+    backtest_data_filtered = all_feature_data.copy()
+    if backtest_start_date:
+        backtest_data_filtered = backtest_data_filtered[
+            backtest_data_filtered.index.get_level_values('Date') >= pd.to_datetime(backtest_start_date)]
+    if backtest_end_date:
+        backtest_data_filtered = backtest_data_filtered[
+            backtest_data_filtered.index.get_level_values('Date') <= pd.to_datetime(backtest_end_date)]
+
+    if backtest_data_filtered.empty:
+        logger.error("No data available for the specified backtest period. Aborting.")
+        return None
+
+    tickers_in_data = backtest_data_filtered.index.get_level_values('Ticker').unique().tolist()
+    added_tickers_count = 0
+    for ticker in tickers_in_data:
+        try:
+            ticker_data = backtest_data_filtered.xs(ticker, level='Ticker').copy()
+            if ticker_data.empty:
+                logger.warning(f"No data for ticker {ticker} in period. Skipping.")
+                continue
+
+            # Ensure standard OHLCV columns are present (Backtrader needs Open, High, Low, Close, Volume)
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col not in ticker_data.columns:
+                    logger.error(f"Ticker {ticker} data missing standard column: {col}. Skipping.")
+                    raise KeyError  # Skip this ticker
+            if 'openinterest' not in ticker_data.columns:
+                ticker_data['openinterest'] = 0.0  # Add dummy if not present
+
+            # The PandasDataWithFeatures class now takes feature_cols in its __init__
+            # However, Backtrader's core feed system usually expects lines to be class attributes.
+            # A common way is to create a dynamic class or pass params to map columns.
+            # For simplicity, let's ensure PandasDataWithFeatures uses the feature_columns
+            # passed to addstrategy for its internal line mapping if that's feasible,
+            # or ensure data feed has all potential features.
+            # The current PandasDataWithFeatures in utils.py dynamically sets lines/params in __init__.
+
+            data_feed = PandasDataWithFeatures(dataname=ticker_data.reset_index(),
+                                               # PandasData needs datetime in a column or index
+                                               feature_cols=feature_columns,
+                                               dtformat=('%Y-%m-%d %H:%M:%S'),  # if Date is index
+                                               datetime='Date',  # Column name for datetime
+                                               open='Open', high='High', low='Low', close='Close', volume='Volume',
+                                               openinterest='openinterest'
+                                               )
+
+            cerebro.adddata(data_feed, name=ticker)
+            added_tickers_count += 1
+            logger.debug(f"Added data feed for {ticker}")
+        except KeyError:  # Catch if essential OHLCV columns were missing after check
+            logger.warning(f"Skipped ticker {ticker} due to missing essential data columns.")
+        except Exception as e:
+            logger.error(f"Error preparing data feed for {ticker}: {e}", exc_info=True)
+
+    if added_tickers_count == 0:
+        logger.error("No data feeds were successfully added to Cerebro. Aborting backtest.")
+        return None
+    logger.info(f"Added data feeds for {added_tickers_count} tickers.")
+
+    # 6. Configure Broker and Sizer
+    cerebro.broker.set_cash(initial_cash)
+    cerebro.broker.setcommission(commission=commission)
+    cerebro.broker.set_slippage_perc(perc=slippage_perc)
+    cerebro.addsizer(FixedFractionPortfolioSizer, perc=position_sizer_perc / 100.0)
+
+    # 7. Add Analyzers
+    cerebro.addanalyzer(btanalyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days, compression=252,
+                        riskfreerate=0.0)
+    cerebro.addanalyzer(btanalyzers.DrawDown, _name='drawdown')
+    cerebro.addanalyzer(btanalyzers.TradeAnalyzer, _name='tradeanalyzer')
+    cerebro.addanalyzer(btanalyzers.Returns, _name='returns', timeframe=bt.TimeFrame.Days)
+    cerebro.addanalyzer(btanalyzers.SQN, _name='sqn')
+
+    # 8. Run Backtest
+    logger.info(f"Starting Cerebro run with initial capital: ${initial_cash:,.2f}")
+    results = cerebro.run()
+    logger.info("Backtest run finished.")
+
+    # 9. Analyze and Print Results
+    if results and results[0]:  # results[0] is the strategy instance
+        strategy_instance = results[0]
+        final_value = cerebro.broker.getvalue()
+        logger.info(f"Final Portfolio Value: ${final_value:,.2f}")
+        logger.info(f"Total Return: {((final_value / initial_cash) - 1) * 100:.2f}%")
+
+        # Access analyzers (example)
+        sharpe_ratio = strategy_instance.analyzers.sharpe.get_analysis().get('sharperatio', 'N/A')
+        max_drawdown = strategy_instance.analyzers.drawdown.get_analysis().max.drawdown
+        sqn = strategy_instance.analyzers.sqn.get_analysis().get('sqn', 'N/A')
+
+        print("\n--- Backtest Performance Summary ---")
+        print(f"Starting Portfolio Value: {initial_cash:,.2f}")
+        print(f"Final Portfolio Value:    {final_value:,.2f}")
+        # ... (add more printouts as in original backtest.py or main.py) ...
+        print(f"Annualized Sharpe Ratio:  {sharpe_ratio if isinstance(sharpe_ratio, str) else sharpe_ratio:.3f}")
+        print(f"Maximum Drawdown:         {max_drawdown:.2f}%")
+        print(f"SQN:                      {sqn if isinstance(sqn, str) else sqn:.2f}")
+
+        trade_analysis = strategy_instance.analyzers.tradeanalyzer.get_analysis()
+        if trade_analysis and trade_analysis.total and trade_analysis.total.total > 0:
+            print("\n--- Trade Analysis ---")
+            # ... (detailed trade stats) ...
         else:
-            logging.error("Could not automatically extract feature names. Please define 'feature_columns' manually.")
-            # *** Define feature_columns manually here based on feature_engineering.py ***
-            # Example: feature_columns = ['SMA_20', 'RSI_14', ..., 'gdelt_tone_mean_lag_5']
-            feature_columns = None  # Force error if not defined
-            # exit() # Or exit if manual definition is required
+            print("\nNo trades were executed.")
 
-    except Exception as e:
-        logging.error(f"Could not extract feature names from the pipeline: {e}. Define 'feature_columns' manually.")
-        # *** Define feature_columns manually here based on feature_engineering.py ***
-        feature_columns = None
-        # exit() # Or exit
-
-except FileNotFoundError:
-    logging.error(f"Model file not found at {MODEL_PATH}. Run model_training.py first.")
-    exit()
-except Exception as e:
-    logging.error(f"Error loading model: {e}", exc_info=True)
-    exit()
-
-# Load the processed data
-all_data = load_processed_data(PROCESSED_DATA_PATH)
-if all_data is None or all_data.empty:
-    logging.error(f"Failed to load processed data from {PROCESSED_DATA_PATH}. Cannot run backtest.")
-    exit()
-
-# Ensure feature_columns is set
-if feature_columns is None:
-    # Try inferring from the loaded data frame if not extracted from model
-    potential_feature_cols = [col for col in all_data.columns if col not in
-                              ['Open', 'High', 'Low', 'Close', 'Volume', 'Ticker', 'Target',
-                               'SQLDATE', 'GLOBALEVENTID', 'Actor1Name', 'Actor2Name',
-                               'SOURCEURL', 'Title From URL', 'CompanyName', 'Sector', 'Industry'] and col not in [
-                                  'open', 'high', 'low', 'close', 'volume', 'openinterest']]
-    if not potential_feature_cols:
-        logging.error("Could not determine feature columns. Exiting.")
-        exit()
-    feature_columns = potential_feature_cols
-    logging.warning(
-        f"Inferred {len(feature_columns)} feature names from data columns. Ensure this matches the training features.")
-    # print("Inferred Features:", feature_columns) # Uncomment for debugging
-
-
-# --- Prepare Data for Backtrader ---
-
-# Create a custom PandasData feed to include all features
-class PandasDataWithFeatures(bt.feeds.PandasData):
-    lines = tuple(feature_columns)  # Add feature columns as lines
-    # Define parameters for the feed, mapping DataFrame columns to Backtrader lines
-    params = tuple(
-        [(col, -1) for col in feature_columns]  # Map each feature column name to a line
-        + [('datetime', None),  # Use the DataFrame index for datetime
-           ('open', 'Open'),  # Map DataFrame 'Open' column to 'open' line
-           ('high', 'High'),  # Map DataFrame 'High' column to 'high' line
-           ('low', 'Low'),  # Map DataFrame 'Low' column to 'low' line
-           ('close', 'Close'),  # Map DataFrame 'Close' column to 'close' line
-           ('volume', 'Volume'),  # Map DataFrame 'Volume' column to 'volume' line
-           ('openinterest', -1)]  # Use -1 if 'openinterest' column doesn't exist
-    )
-
-
-# --- Setup Backtrader Cerebro Engine ---
-cerebro = bt.Cerebro(stdstats=False)  # Disable default observers initially
-
-# Add Strategy
-cerebro.addstrategy(MLTradingStrategy,
-                    model=model_pipeline,
-                    feature_cols=feature_columns,
-                    buy_threshold=0.55,  # Example threshold
-                    sell_threshold=0.45,  # Example threshold
-                    printlog=False)  # Set to True for detailed strategy logs
-
-# Add Data Feeds
-logging.info("Preparing and adding data feeds to Cerebro...")
-tickers_in_data = all_data.index.get_level_values('Ticker').unique().tolist()
-
-# Optional: Filter tickers if needed (e.g., based on stock_info or a predefined list)
-# tickers_to_backtest = ['AAPL', 'MSFT', 'GOOGL'] # Example subset
-tickers_to_backtest = tickers_in_data  # Use all available tickers
-
-added_tickers = []
-for ticker in tickers_to_backtest:
-    try:
-        # Select data for the current ticker
-        ticker_data = all_data.xs(ticker, level='Ticker').copy()
-
-        # Apply date filtering if specified
-        if BACKTEST_START_DATE:
-            ticker_data = ticker_data[ticker_data.index >= pd.to_datetime(BACKTEST_START_DATE)]
-        if BACKTEST_END_DATE:
-            ticker_data = ticker_data[ticker_data.index <= pd.to_datetime(BACKTEST_END_DATE)]
-
-        # Check if data exists for the period
-        if ticker_data.empty:
-            logging.warning(f"No data found for ticker {ticker} in the specified date range. Skipping.")
-            continue
-
-        # Ensure required columns exist and add 'openinterest' if missing
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume'] + feature_columns
-        missing_cols = [col for col in required_cols if col not in ticker_data.columns]
-        if missing_cols:
-            logging.warning(f"Missing columns for ticker {ticker}: {missing_cols}. Skipping.")
-            continue
-
-        if 'openinterest' not in ticker_data.columns:
-            ticker_data['openinterest'] = 0
-
-        # Add data feed to Cerebro
-        data_feed = PandasDataWithFeatures(dataname=ticker_data)
-        cerebro.adddata(data_feed, name=ticker)
-        added_tickers.append(ticker)
-        logging.debug(f"Added data feed for {ticker}")
-
-    except KeyError:
-        logging.warning(f"Ticker {ticker} not found in the processed data index. Skipping.")
-    except Exception as e:
-        logging.error(f"Error preparing data feed for {ticker}: {e}", exc_info=True)
-
-if not added_tickers:
-    logging.error("No data feeds were added to Cerebro. Exiting.")
-    exit()
-
-logging.info(f"Added data feeds for {len(added_tickers)} tickers.")
-
-# Configure Broker
-cerebro.broker.set_cash(INITIAL_CASH)
-cerebro.broker.setcommission(commission=COMMISSION_PER_TRADE)
-# Add slippage (optional) - Simple percentage slippage
-cerebro.broker.set_slippage_perc(perc=SLIPPAGE_PERCENT)
-
-
-# Configure Sizer
-# Allocate a percentage of the *available cash* for each new position
-# cerebro.addsizer(bt.sizers.PercentSizer, percents=POSITION_SIZE_PERCENT)
-# Or, allocate a percentage of the *total portfolio value*
-class FixedFractionPortfolioSizer(bt.Sizer):
-    params = (('perc', 0.05),)  # Default 5% of portfolio value per trade
-
-    def _getsizing(self, comminfo, cash, data, isbuy):
-        size = self.broker.getvalue() * self.p.perc / data.close[0]
-        return int(size)  # Return integer number of shares
-
-
-cerebro.addsizer(FixedFractionPortfolioSizer, perc=POSITION_SIZE_PERCENT / 100.0)
-
-# Add Analyzers
-cerebro.addanalyzer(btanalyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days, compression=252,
-                    riskfreerate=0.0)  # Annualized Sharpe
-cerebro.addanalyzer(btanalyzers.DrawDown, _name='drawdown')
-cerebro.addanalyzer(btanalyzers.TradeAnalyzer, _name='tradeanalyzer')
-cerebro.addanalyzer(btanalyzers.Returns, _name='returns', timeframe=bt.TimeFrame.Days)
-cerebro.addanalyzer(btanalyzers.SQN, _name='sqn')  # System Quality Number
-
-# --- Run Backtest ---
-logging.info(f"Starting backtest with initial capital: ${INITIAL_CASH:,.2f}")
-results = cerebro.run()
-logging.info("Backtest finished.")
-
-# --- Analyze Results ---
-if results and results[0]:
-    strategy_instance = results[0]
-    final_value = cerebro.broker.getvalue()
-    logging.info(f"Final Portfolio Value: ${final_value:,.2f}")
-    logging.info(f"Total Return: {((final_value / INITIAL_CASH) - 1) * 100:.2f}%")
-
-    # Access analyzers
-    sharpe_ratio = strategy_instance.analyzers.sharpe.get_analysis().get('sharperatio', 'N/A')
-    max_drawdown = strategy_instance.analyzers.drawdown.get_analysis().max.drawdown
-    trade_analysis = strategy_instance.analyzers.tradeanalyzer.get_analysis()
-    sqn = strategy_instance.analyzers.sqn.get_analysis().get('sqn', 'N/A')
-
-    print("\n--- Backtest Performance Summary ---")
-    print(f"Starting Portfolio Value: {INITIAL_CASH:,.2f}")
-    print(f"Final Portfolio Value:    {final_value:,.2f}")
-    print(f"Total Return:             {((final_value / INITIAL_CASH) - 1) * 100:.2f}%")
-    print(f"Annualized Sharpe Ratio:  {sharpe_ratio:.3f}" if isinstance(sharpe_ratio,
-                                                                        float) else f"Annualized Sharpe Ratio:  {sharpe_ratio}")
-    print(f"Maximum Drawdown:         {max_drawdown:.2f}%")
-    print(f"SQN:                      {sqn:.2f}" if isinstance(sqn, float) else f"SQN:                      {sqn}")
-
-    if trade_analysis and trade_analysis.total and trade_analysis.total.total > 0:
-        print("\n--- Trade Analysis ---")
-        print(f"Total Trades:             {trade_analysis.total.total}")
-        print(f"Total Closed Trades:      {trade_analysis.total.closed}")
-        print(f"Winning Trades:           {trade_analysis.won.total}")
-        print(f"Losing Trades:            {trade_analysis.lost.total}")
-        if trade_analysis.total.closed > 0:
-            print(f"Win Rate:                 {trade_analysis.won.total / trade_analysis.total.closed * 100:.2f}%")
-            print(f"Average Win ($):        {trade_analysis.won.pnl.average:.2f}")
-            print(f"Average Loss ($):       {trade_analysis.lost.pnl.average:.2f}")
-            profit_factor = abs(
-                trade_analysis.won.pnl.total / trade_analysis.lost.pnl.total) if trade_analysis.lost.pnl.total != 0 else float(
-                'inf')
-            print(f"Profit Factor:            {profit_factor:.2f}")
-            print(f"Avg Trade PnL ($):      {trade_analysis.pnl.net.average:.2f}")
-        else:
-            print("No trades were closed during the backtest.")
+        # 10. Plotting (Optional)
+        if plot_results:
+            try:
+                # Ensure matplotlib is configured for non-interactive backend if needed
+                figure = cerebro.plot(style='candlestick', barup='green', bardown='red', volume=True, iplot=False)[0][0]
+                figure.set_size_inches(18, 10)
+                plot_filename = 'backtest_results_plot.png'
+                figure.savefig(plot_filename, dpi=300)
+                logger.info(f"Backtest plot saved to {plot_filename}")
+            except ImportError:
+                logger.warning("Matplotlib not found. Skipping plot generation. Install with: pip install matplotlib")
+            except Exception as e:
+                logger.error(f"Error during plotting: {e}", exc_info=True)
+        return results  # Return strategy results for potential further analysis
     else:
-        print("\n--- Trade Analysis ---")
-        print("No trades were executed during the backtest.")
+        logger.error("Backtest did not produce results.")
+        return None
 
-    # --- Plotting (Optional) ---
-    # Ensure matplotlib is installed: pip install matplotlib
-    try:
-        import matplotlib
 
-        # You might need to set a non-interactive backend if running on a server without a display
-        # matplotlib.use('Agg')
-        print("\nGenerating plot...")
-        cerebro.plot(style='candlestick', barup='green', bardown='red')
-        # The plot will be displayed or saved depending on the environment/matplotlib backend.
-        # You might need plt.show() or fig.savefig('backtest_results.png')
-        print("Plot generation command issued.")
-    except ImportError:
-        logging.warning("Matplotlib not found. Skipping plot generation. Install with: pip install matplotlib")
-    except Exception as e:
-        logging.error(f"Error during plotting: {e}")
+if __name__ == "__main__":
+    # This block allows running backtest.py standalone with default or specified parameters.
+    # However, main.py is intended as the primary orchestrator.
+    # If running this standalone, ensure the processed data and model files exist at default paths.
 
-else:
-    logging.error("Backtest did not produce results.")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger.info("--- Running backtest.py as standalone script ---")
+    logger.warning("This is for isolated backtesting. For the full pipeline, run main.py.")
+
+    # Example: Run with default parameters
+    # To run, ensure 'processed_data/final_features.parquet' and model files in 'models/' exist.
+    # You might need to run main.py with FORCE_DATA_PROCESSING and FORCE_MODEL_TRAINING first.
+
+    # run_backtest(plot_results=True)
+
+    logger.info("Standalone backtest.py execution finished. "
+                "Uncomment `run_backtest()` call above with appropriate paths to execute.")
