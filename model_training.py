@@ -11,9 +11,10 @@ from sklearn.compose import ColumnTransformer
 import joblib
 import os
 import logging
+import gc
 
 # Import from local modules
-from utils import load_processed_data, save_model_artefacts  # Use utils for loading data and saving model
+from utils import load_processed_data, save_model_artefacts, downcast_numeric_df  # Use utils for loading data and saving model
 
 logger = logging.getLogger(__name__)
 
@@ -95,19 +96,25 @@ def split_data_chronological(df, target_column_name, test_size=0.2,
     return X_train, X_test, y_train, y_test, feature_columns
 
 
-def train_evaluate_and_save_model(processed_data_path, target_variable_name,
-                                  model_save_path, features_save_path,
-                                  lgbm_params=None, test_ratio=0.2):
+# def train_evaluate_and_save_model(processed_data_path, target_variable_name, ...): # OLD
+def train_evaluate_and_save_model(input_data: pd.DataFrame, target_variable_name: str, # NEW
+                                  model_save_path: str, features_save_path: str,
+                                  lgbm_params: dict = None, test_ratio: float = 0.2):
     """
-    Main function to load data, train, evaluate, and save the model and feature list.
+    Main function to use input data, train, evaluate, and save the model and feature list.
     """
     if lgbm_params is None:
-        lgbm_params = LGBM_PARAMS
+        lgbm_params = LGBM_PARAMS # Assuming LGBM_PARAMS is defined globally in this file
 
-    data = load_processed_data(processed_data_path)
+    data = input_data # Use the passed DataFrame
+
     if data is None or data.empty:
-        logger.error("Model training aborted: No data loaded.")
+        logger.error("Model training aborted: No input data provided or data is empty.")
         return None, []
+
+    # logger.info(f"Received input data for training. Shape: {data.shape}")
+    # data = downcast_numeric_df(data) # Apply downcasting to the passed DataFrame
+                                    # Data should already be downcasted by main.py
 
     # Drop rows with NaN in target (can happen due to target shifting)
     initial_rows = len(data)
@@ -119,9 +126,22 @@ def train_evaluate_and_save_model(processed_data_path, target_variable_name,
         logger.error("Model training aborted: Data became empty after dropping NaN targets.")
         return None, []
 
+    # Store reference to original df before splitting if you need to delete it later
+    # The 'data' df is used in split_data_chronological.
+    # split_data_chronological creates train_df and test_df, then X_train etc. from them.
+
+    # Original df (passed as 'df' argument to split_data_chronological)
+    # is df_sorted inside split_data_chronological
     X_train, X_test, y_train, y_test, feature_cols = split_data_chronological(
-        data, target_variable_name, test_size=test_ratio
+        data, target_variable_name, test_size=test_ratio  # 'data' is passed here
     )
+
+    # --->>> NEW: Delete the full 'data' DataFrame if it's large and no longer needed <<<---
+    # X_train, X_test etc. should now hold the necessary portions.
+    logger.info("Deleting full 'data' DataFrame to free memory.")
+    del data
+    gc.collect()  # Trigger garbage collection
+    # --->>> END NEW <<<---
 
     if X_train is None or X_train.empty:
         logger.error("Model training aborted: Training data is empty after split.")
@@ -163,6 +183,12 @@ def train_evaluate_and_save_model(processed_data_path, target_variable_name,
     logger.info("Starting model training...")
     pipeline.fit(X_train, y_train)
     logger.info("Model training complete.")
+
+    # --->>> NEW: Optionally delete training data if not needed for extensive post-analysis <<<---
+    # logger.info("Deleting X_train, y_train to free memory before evaluation.")
+    # del X_train, y_train
+    # gc.collect()
+    # --->>> END NEW <<<---
 
     logger.info("Evaluating model on the test set...")
     if X_test.empty:

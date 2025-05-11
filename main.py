@@ -1,4 +1,6 @@
 # main.py
+import gc
+
 import pandas as pd
 import numpy as np
 import os
@@ -12,7 +14,7 @@ import model_training  # Contains training and evaluation logic
 from trading_strategy import MLTradingStrategy
 from utils import (clean_company_name, load_processed_data,
                    PandasDataWithFeatures, FixedFractionPortfolioSizer,
-                   load_model_artefacts)  # Centralized utilities
+                   load_model_artefacts, downcast_numeric_df)  # Centralized utilities
 # For backtesting, import Backtrader and analyzers if not calling backtest.py's function
 import backtrader as bt
 import backtrader.analyzers as btanalyzers
@@ -62,13 +64,14 @@ BT_START_DATE = None  # e.g., '2022-01-01'
 BT_END_DATE = None  # e.g., '2023-12-31'
 
 # 5. Control Flags
-FORCE_DATA_PROCESSING = True
-FORCE_MODEL_TRAINING = True
+FORCE_DATA_PROCESSING = False
+FORCE_MODEL_TRAINING = False
 
 
 # --- Main Workflow Function ---
 def run_trading_pipeline():
     logger.info("--- Starting Algorithmic Trading Pipeline ---")
+    final_features_df = None  # Initialize
 
     # --- Step 1 & 2: Data Loading and Feature Engineering ---
     final_features_df = None
@@ -120,7 +123,7 @@ def run_trading_pipeline():
             return
 
         # Ensure index is Date, Ticker after merge for subsequent steps
-        if not (isinstance(merged_data.index, pd.MultiIndex) and \
+        if not (isinstance(merged_data.index, pd.MultiIndex) and
                 {'Date', 'Ticker'}.issubset(merged_data.index.names)):
             if {'Date', 'Ticker'}.issubset(merged_data.columns):
                 merged_data.set_index(['Date', 'Ticker'], inplace=True)
@@ -168,13 +171,31 @@ def run_trading_pipeline():
         except Exception as e:
             logger.error(f"Failed to save processed data: {e}", exc_info=True)
             # Decide if to proceed without saving or exit
+
+        if final_features_df is not None and not final_features_df.empty:
+            logger.info("Downcasting 'final_features_df' immediately after creation/processing.")
+            final_features_df = downcast_numeric_df(final_features_df)
+            gc.collect()
+        else:
+            logger.error("Data processing resulted in an empty DataFrame. Exiting.")
+            return
+
     else:
         logger.info(f"--- Phase: Loading Pre-processed Data from {PROCESSED_FEATURES_FILE} ---")
         final_features_df = load_processed_data(PROCESSED_FEATURES_FILE)  # From utils
-        if final_features_df is None or final_features_df.empty:
-            logger.error("Failed to load pre-processed data. Consider re-running with FORCE_DATA_PROCESSING=True.")
+
+        if final_features_df is not None and not final_features_df.empty:
+            logger.info("Downcasting 'final_features_df' immediately after loading from file.")
+            final_features_df = downcast_numeric_df(final_features_df)
+            gc.collect()
+        else:
+            logger.error(f"Failed to load pre-processed data from {PROCESSED_FEATURES_FILE}. Exiting.")
             return
-        # load_processed_data from utils should handle setting the index if Date/Ticker are columns.
+
+    # At this point, final_features_df should be loaded and downcasted, regardless of the path taken.
+    if final_features_df is None or final_features_df.empty:
+        logger.error("Critical error: final_features_df is not available after data loading/processing. Exiting.")
+        return
 
     # --- Step 3: Model Training ---
     trained_model = None
@@ -182,16 +203,13 @@ def run_trading_pipeline():
 
     if FORCE_MODEL_TRAINING or not os.path.exists(MODEL_FILE) or not os.path.exists(MODEL_FEATURES_FILE):
         logger.info("--- Phase: Model Training ---")
-        if final_features_df is None or final_features_df.empty:
-            logger.error("Cannot train model: No processed data available.")
-            return
-
+        # final_features_df is already loaded and should be downcasted.
         trained_model, model_feature_columns = model_training.train_evaluate_and_save_model(
-            processed_data_path=PROCESSED_FEATURES_FILE,  # Pass path, function will load
+            input_data=final_features_df,  # Pass the (already downcasted) DataFrame
             target_variable_name=MODEL_TARGET_VARIABLE,
             model_save_path=MODEL_FILE,
             features_save_path=MODEL_FEATURES_FILE,
-            lgbm_params=model_training.LGBM_PARAMS,  # Use params from model_training module
+            lgbm_params=model_training.LGBM_PARAMS,
             test_ratio=TRAIN_TEST_RATIO
         )
         if trained_model is None:
@@ -210,17 +228,45 @@ def run_trading_pipeline():
 
     # --- Step 4: Backtesting ---
     logger.info("--- Phase: Backtesting ---")
-    if trained_model is None or final_features_df is None or final_features_df.empty:
-        logger.error("Cannot run backtest: Model or processed data is not available.")
+    if trained_model is None:
+        logger.error("Model not available for backtesting. Exiting.")
         return
-
+    if final_features_df is None or final_features_df.empty:  # Should have been caught earlier
+        logger.error("Processed data (final_features_df) is not available for backtesting. Exiting.")
+        return
     if model_feature_columns is None:
         logger.error("Feature columns used for training are not available. Cannot reliably run backtest. Exiting.")
-        # As a last resort, one might try to infer them, but this is highly discouraged for reproducibility.
-        # Example inference (very risky, only if `model_feature_columns` is truly unobtainable):
-        # cols_to_exclude_infer = [MODEL_TARGET_VARIABLE, 'Open', 'High', 'Low', 'Close', 'Volume', 'Ticker', ...]
-        # model_feature_columns = [col for col in final_features_df.columns if col not in cols_to_exclude_infer]
-        # if not model_feature_columns: logger.error("Could not infer features for backtest."); return
+        return
+
+    # final_features_df should be the downcasted version now.
+    logger.info(
+        f"Preparing to copy 'final_features_df' for backtesting. Current memory usage: {final_features_df.memory_usage(deep=True).sum() / (1024 ** 2):.2f} MB")
+    try:
+        backtest_run_data = final_features_df.copy()  # This is where it crashed previously
+        logger.info("Successfully copied 'final_features_df' into 'backtest_run_data'.")
+    except MemoryError as e:
+        logger.error(f"MemoryError during final_features_df.copy() even after downcasting attempts: {e}", exc_info=True)
+        logger.error(
+            f"Memory usage of final_features_df before copy: {final_features_df.memory_usage(deep=True).sum() / (1024 ** 2):.2f} MB")
+        logger.error(
+            "If downcasting was not effective, you may need to reduce features or use a machine with more RAM.")
+        return
+
+    # Optional: If memory is extremely tight, and final_features_df is not needed anymore
+    # logger.info("Deleting 'final_features_df' after copy to free up memory before Cerebro run.")
+    # del final_features_df
+    # gc.collect()
+
+    # Filter data for the backtest period (BT_START_DATE, BT_END_DATE)
+    if BT_START_DATE:
+        backtest_run_data = backtest_run_data[
+            backtest_run_data.index.get_level_values('Date') >= pd.to_datetime(BT_START_DATE)]
+    if BT_END_DATE:
+        backtest_run_data = backtest_run_data[
+            backtest_run_data.index.get_level_values('Date') <= pd.to_datetime(BT_END_DATE)]
+
+    if backtest_run_data.empty:
+        logger.error("No data available for the specified backtest period in main.py.")
         return
 
     # Using the run_backtest function from backtest.py (or embed logic here)
@@ -273,11 +319,15 @@ def run_trading_pipeline():
             # Pass feature_cols to PandasDataWithFeatures constructor
             data_feed_bt = PandasDataWithFeatures(
                 dataname=df_ticker_bt.reset_index(),  # PandasData often prefers datetime as a column
-                feature_cols=model_feature_columns,  # Key: pass the correct feature list
-                dtformat=('%Y-%m-%d %H:%M:%S'),  # If Date is index
-                datetime='Date',
-                open='Open', high='High', low='Low', close='Close', volume='Volume',
-                openinterest='openinterest'
+                feature_cols=model_feature_columns,  # Pass the correct feature list
+                # dtformat=('%Y-%m-%d %H:%M:%S'),  # <--- REMOVE THIS LINE
+                datetime='Date',  # This tells PandasData to look for a 'Date' column
+                open='Open',
+                high='High',
+                low='Low',
+                close='Close',
+                volume='Volume',
+                openinterest='openinterest'  # Make sure 'openinterest' column exists in df_ticker_bt
             )
             cerebro.adddata(data_feed_bt, name=ticker)
             added_tickers_bt_count += 1
