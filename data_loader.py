@@ -12,111 +12,100 @@ logger = logging.getLogger(__name__)
 def load_stock_data(file_path):
     """
     Loads daily stock data (OHLCV) from a CSV file with a specific multi-header format.
-    Revised to address KeyError: ['Date'] and improve robustness.
+    Revised for robust MultiIndex column creation.
     """
     logger.info(f"Attempting to load stock data from: {file_path}")
     try:
-        # Read the first header row (Metrics: Price, Close, Close, ...)
-        header_metrics_df = pd.read_csv(file_path, nrows=1, header=0)
-        # Read the second header row (Tickers: Ticker, A, AA, ...)
+        # Read header rows
+        header_metrics_df = pd.read_csv(file_path, nrows=1, header=None)
         header_tickers_df = pd.read_csv(file_path, skiprows=1, nrows=1, header=None)
 
-        # Extract metric types and ticker symbols
-        metric_types_list = header_metrics_df.columns[1:].tolist()  # First item is "Price"
-        stock_tickers_list = header_tickers_df.iloc[0, 1:].tolist()  # First item is "Ticker"
+        metric_types_list = header_metrics_df.iloc[0, 1:].tolist()
+        stock_tickers_list = header_tickers_df.iloc[0, 1:].tolist()
 
+        if not metric_types_list or not stock_tickers_list:
+            logger.error("Could not extract metric types or stock tickers. Check CSV format.")
+            return None
         if len(metric_types_list) != len(stock_tickers_list):
-            logger.error(
-                f"Header mismatch: {len(metric_types_list)} metric headers, {len(stock_tickers_list)} ticker headers."
-            )
+            logger.error(f"Header mismatch: {len(metric_types_list)} metrics, {len(stock_tickers_list)} tickers.")
             return None
 
-        # Read the data body, skipping the first 3 rows (two explicit headers + "Date,,," line)
-        raw_data_df = pd.read_csv(file_path, skiprows=3, header=None, na_values=['null', 'NA', ''])
-
+        # Read data body
+        raw_data_df = pd.read_csv(file_path, skiprows=2, header=None, na_values=['null', 'NA', ''])
         if raw_data_df.empty:
-            logger.error("No data rows found after skipping headers in the CSV file.")
+            logger.error("No data rows found after skipping headers.")
             return None
 
-        # The first column (index 0) of raw_data_df is the date
-        # The subsequent columns are the stock data values
         num_expected_value_cols = len(metric_types_list)
-        if raw_data_df.shape[1] != num_expected_value_cols + 1:  # +1 for the date column
+        if raw_data_df.shape[1] != num_expected_value_cols + 1: # +1 for date column
             logger.error(
-                f"Data column count mismatch: Expected {num_expected_value_cols + 1} columns (Date + values), "
-                f"found {raw_data_df.shape[1]}. Check CSV structure and skiprows."
+                f"Data column count mismatch: Expected {num_expected_value_cols + 1}, found {raw_data_df.shape[1]}."
             )
             return None
 
-        # Create a dictionary for DataFrame construction
-        data_dict = {}
+        # Prepare MultiIndex for columns
+        column_multi_index = pd.MultiIndex.from_arrays(
+            [metric_types_list, stock_tickers_list],
+            names=['Metric', 'Ticker']
+        )
 
-        # Add Date column first
-        # The warning about date format inference suggests that some date strings might be problematic.
-        # If you know the consistent format of your dates (e.g., 'YYYY-MM-DD'), provide it.
-        # Example: data_dict['Date'] = pd.to_datetime(raw_data_df.iloc[:, 0], format='%Y-%m-%d', errors='coerce')
-        data_dict['Date'] = pd.to_datetime(raw_data_df.iloc[:, 0], errors='coerce')
-
-        # Create MultiIndex for stock data columns
-        column_multi_index = pd.MultiIndex.from_arrays([metric_types_list, stock_tickers_list],
-                                                       names=['Metric', 'Ticker'])
-
-        # Add stock data columns
+        # Prepare dictionary for stock data values, converting to numeric
+        stock_data_values = {}
         for i, col_tuple in enumerate(column_multi_index):
-            data_dict[col_tuple] = raw_data_df.iloc[:, i + 1]  # i+1 because data_body_df's first col is date
+            # raw_data_df.iloc[:, 0] is Date, data values start from raw_data_df.iloc[:, 1]
+            stock_data_values[col_tuple] = pd.to_numeric(raw_data_df.iloc[:, i + 1], errors='coerce')
 
-        df_final = pd.DataFrame(data_dict)
+        # Create DataFrame for stock data, ensuring columns are the specified MultiIndex
+        df_final = pd.DataFrame(stock_data_values, columns=column_multi_index)
 
-        # Ensure 'Date' column is present and drop rows with NaT dates
-        if 'Date' not in df_final.columns:
-            logger.critical("Programming error: 'Date' column was not correctly added to df_final.")
-            return None
-        df_final.dropna(subset=['Date'], inplace=True)
+        # Set Date index
+        date_series = pd.to_datetime(raw_data_df.iloc[:, 0], errors='coerce')
+        df_final.index = date_series
+        df_final.index.name = 'Date'
+
+        # Drop rows where the Date index itself is NaT (Not a Time)
+        df_final = df_final[df_final.index.notna()]
+
+        # Drop rows if all values across all metrics/tickers for a date are NaN
+        df_final.dropna(axis=0, how='all', inplace=True)
 
         if df_final.empty:
-            logger.warning("DataFrame is empty after dropping rows with invalid dates.")
-            # You might want to return an empty DataFrame structured as expected by later stages
-            # For now, returning None or an empty DataFrame.
-            return pd.DataFrame()
+            logger.warning("DataFrame is empty after initial creation and NaT date filtering.")
+            # Consider returning an empty DataFrame with expected structure if needed downstream
+            return df_final # Returns an empty DataFrame
 
-        df_final.set_index('Date', inplace=True)
+        logger.debug(f"Columns after DataFrame creation: {df_final.columns}")
+        logger.debug(f"Column names after DataFrame creation: {df_final.columns.names}") # Should be ['Metric', 'Ticker']
 
-        # df_final.columns is now the MultiIndex: [('Close', 'A'), ('Close', 'AA'), ...]
-        # The names of the levels should be ['Metric', 'Ticker']
-        logger.debug(f"Columns before stacking: {df_final.columns}")
-        logger.debug(f"Column names before stacking: {df_final.columns.names}")
-
-        # Stack to bring 'Ticker' (level 1 of columns) and 'Metric' (level 0 of columns) into the index.
-        # The order in `level` specifies which levels to pivot from columns to index.
-        stock_data_long = df_final.stack(level=['Ticker', 'Metric'], dropna=False)
+        # Stack to bring 'Ticker' (level 1) and 'Metric' (level 0) from columns into the index.
+        stock_data_long = df_final.stack(level=['Ticker', 'Metric'], future_stack=True)
 
         # Unstack the 'Metric' level to turn metrics (Open, High, Low, Close, Volume) into columns.
         stock_data_long = stock_data_long.unstack(level='Metric')
 
-        # The index should now be (Date, Ticker).
-        stock_data_long.index.names = ['Date', 'Ticker']
+        stock_data_long.index.names = ['Date', 'Ticker'] # Ensure final index names are set
 
-        # Ensure standard OHLCV column names and convert to numeric
+        # Ensure standard OHLCV column names are present
         expected_metrics = ['Open', 'High', 'Low', 'Close', 'Volume']
+        actual_metrics_in_columns = stock_data_long.columns.tolist()
 
-        # Create a rename map if the original metric names in the file are different
-        # e.g. if CSV uses "Close Price" map it to "Close"
-        # For now, assuming the metric names in the CSV header are 'Open', 'High', 'Low', 'Close', 'Volume'
-
-        cols_to_convert_to_numeric = [col for col in expected_metrics if col in stock_data_long.columns]
-        for col in cols_to_convert_to_numeric:
-            stock_data_long[col] = pd.to_numeric(stock_data_long[col], errors='coerce')
-
-        missing_final_cols = [col for col in expected_metrics if col not in stock_data_long.columns]
+        missing_final_cols = [col for col in expected_metrics if col not in actual_metrics_in_columns]
         if missing_final_cols:
             logger.warning(f"After processing, some expected OHLCV columns are missing: {missing_final_cols}. "
-                           f"Available columns: {stock_data_long.columns.tolist()}")
+                           f"Available columns: {actual_metrics_in_columns}")
+            for col in missing_final_cols:
+                stock_data_long[col] = pd.NA # Add missing columns with NA
 
         stock_data_long.sort_index(inplace=True)
         logger.info(f"Successfully loaded and processed stock data. Shape: {stock_data_long.shape}")
+
         if not stock_data_long.empty:
-            logger.info(f"Sample of processed stock data (first 5 rows of AAPL if available):\n"
-                        f"{stock_data_long.xs('AAPL', level='Ticker', drop_level=False).head() if 'AAPL' in stock_data_long.index.get_level_values('Ticker') else stock_data_long.head()}")
+            sample_ticker = stock_tickers_list[0] if stock_tickers_list else None
+            if sample_ticker and sample_ticker in stock_data_long.index.get_level_values('Ticker'):
+                logger.info(f"Sample of processed stock data (first 5 rows of {sample_ticker}):\n"
+                            f"{stock_data_long.xs(sample_ticker, level='Ticker', drop_level=False).head()}")
+            else:
+                logger.info(f"Sample of processed stock data (first 5 rows):\n{stock_data_long.head()}")
         return stock_data_long
 
     except FileNotFoundError:
@@ -173,6 +162,17 @@ def load_gdelt_data(file_path):
             return pd.DataFrame()
 
         gdelt_df = pd.DataFrame(all_events)
+
+        if not gdelt_df.empty:
+            logger.debug(f"GDELT data raw (before to_numeric/fillna) - describe a few key columns:\n"
+                         f"{gdelt_df[['GoldsteinScale', 'AvgTone', 'NumArticles']].astype(str).describe(include='all')}")  # Use astype(str) for describe if mixed types before numeric conversion
+            # Convert to numeric once to avoid issues with describe on mixed types from JSON
+            gdelt_df['GoldsteinScale'] = pd.to_numeric(gdelt_df['GoldsteinScale'], errors='coerce')
+            gdelt_df['AvgTone'] = pd.to_numeric(gdelt_df['AvgTone'], errors='coerce')
+            gdelt_df['NumArticles'] = pd.to_numeric(gdelt_df['NumArticles'], errors='coerce')
+            logger.debug(f"GDELT data (after to_numeric, before fillna) - describe key columns:\n"
+                         f"{gdelt_df[['GoldsteinScale', 'AvgTone', 'NumArticles']].describe()}")
+
         gdelt_df['SQLDATE'] = pd.to_datetime(gdelt_df['SQLDATE'], format='%Y%m%d', errors='coerce')
 
         # Select and ensure essential columns exist
@@ -188,6 +188,11 @@ def load_gdelt_data(file_path):
         gdelt_df['GoldsteinScale'] = pd.to_numeric(gdelt_df['GoldsteinScale'], errors='coerce').fillna(0.0)
         gdelt_df['AvgTone'] = pd.to_numeric(gdelt_df['AvgTone'], errors='coerce').fillna(0.0)
         gdelt_df['NumArticles'] = pd.to_numeric(gdelt_df['NumArticles'], errors='coerce').fillna(0).astype(int)
+
+        if not gdelt_df.empty:
+            logger.debug(f"GDELT data (after fillna(0)) - describe key columns:\n"
+                         f"{gdelt_df[['GoldsteinScale', 'AvgTone', 'NumArticles']].describe()}")
+
 
         gdelt_df['Actor1Name_Clean'] = gdelt_df['Actor1Name'].apply(clean_company_name)
         gdelt_df['Actor2Name_Clean'] = gdelt_df['Actor2Name'].apply(clean_company_name)
@@ -246,9 +251,13 @@ def load_stock_info(file_path):
                 return None
 
         info_df.rename(columns=rename_map, inplace=True)
+        # Pandas 3.0+ compatible way for inplace fillna on the DataFrame:
+        fill_values = {'Sector': 'Unknown', 'Industry': 'Unknown'}
+        info_df.fillna(value=fill_values, inplace=True)
+        # Alternatively, assign back:
+        # info_df['Sector'] = info_df['Sector'].fillna('Unknown')
+        # info_df['Industry'] = info_df['Industry'].fillna('Unknown')
         info_df['CompanyName_Clean'] = info_df['CompanyName'].apply(clean_company_name)
-        info_df['Sector'].fillna('Unknown', inplace=True)
-        info_df['Industry'].fillna('Unknown', inplace=True)
 
         logger.info(f"Successfully loaded and processed stock info data. Shape: {info_df.shape}")
         return info_df

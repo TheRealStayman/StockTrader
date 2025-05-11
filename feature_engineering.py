@@ -29,50 +29,157 @@ except LookupError:
 
 # --- Feature Engineering Functions ---
 
-def add_technical_indicators(stock_df):
+def add_technical_indicators(stock_df, macd_config=None, bbands_config=None, aroc_config=None, adx_config=None):
     logger.info("Calculating technical indicators...")
-    if not isinstance(stock_df.index, pd.MultiIndex) or not {'Date', 'Ticker'}.issubset(stock_df.index.names):
-        logger.error("Stock DataFrame must have a MultiIndex with levels 'Date' and 'Ticker' for TA calculation.")
-        # Try to set it if columns exist
-        if {'Date', 'Ticker'}.issubset(stock_df.columns):
-            logger.info("Attempting to set Date/Ticker index for TA.")
-            stock_df = stock_df.set_index(['Date', 'Ticker'])
-        else:
-            return stock_df  # Or raise error
-
-    stock_df = stock_df.sort_index()  # Ensures correct order for TA
-
-    # Use pandas_ta library. Group by Ticker for correct calculations.
-    # Note: pandas_ta can often handle grouped DataFrames directly or apply per group.
-    # Ensure inputs to ta functions are Series (e.g., stock_df.groupby(level='Ticker')['Close'].apply(...))
     try:
-        stock_df['SMA_20'] = stock_df.groupby(level='Ticker')['Close'].apply(lambda x: ta.sma(x, length=20))
-        stock_df['SMA_50'] = stock_df.groupby(level='Ticker')['Close'].apply(lambda x: ta.sma(x, length=50))
-        stock_df['RSI_14'] = stock_df.groupby(level='Ticker')['Close'].apply(lambda x: ta.rsi(x, length=14))
+        if not isinstance(stock_df.index, pd.MultiIndex) or stock_df.index.nlevels != 2:
+            logger.error(f"stock_df.index is not a 2-level MultiIndex at the start. Index: {stock_df.index[:5]}")
+            return stock_df
+        if not stock_df.index.is_monotonic_increasing:
+            logger.warning("Stock data index is not sorted. Sorting for TA calculations...")
+            stock_df = stock_df.sort_index()
 
-        # MACD
-        macd_df = stock_df.groupby(level='Ticker')['Close'].apply(
-            lambda x: ta.macd(x, fast=12, slow=26, signal=9)).reset_index()
-        macd_df = macd_df.set_index(['Date', 'Ticker'])  # Set index to join
-        stock_df = stock_df.join(macd_df, how='left')
+        grouped_by_ticker = stock_df.groupby(level='Ticker')
 
-        # Bollinger Bands
-        bbands_df = stock_df.groupby(level='Ticker')['Close'].apply(
-            lambda x: ta.bbands(x, length=20, std=2)).reset_index()
-        bbands_df = bbands_df.set_index(['Date', 'Ticker'])
-        stock_df = stock_df.join(bbands_df, how='left')
+        # --- Single-series input indicators (SMA, EMA, RSI, MACD components, BBands components) ---
+        logger.debug("Calculating SMA, EMA, RSI...")
+        stock_df['SMA_20'] = grouped_by_ticker['Close'].transform(lambda x: ta.sma(x, length=20))
+        stock_df['EMA_20'] = grouped_by_ticker['Close'].transform(lambda x: ta.ema(x, length=20))
+        stock_df['RSI'] = grouped_by_ticker['Close'].transform(lambda x: ta.rsi(x, length=14))
 
-        # ATR (needs High, Low, Close)
-        stock_df['ATR_14'] = stock_df.groupby(level='Ticker').apply(
-            lambda x: ta.atr(high=x['High'], low=x['Low'], close=x['Close'], length=14)
-        ).reset_index(level=0, drop=True)  # Align results
+        logger.debug("Calculating MACD...")
+        macd_cfg = macd_config if macd_config else {}
+        fast = macd_cfg.get('fast', 12);
+        slow = macd_cfg.get('slow', 26);
+        signal = macd_cfg.get('signal', 9)
+        col_macd_line = f'MACD_{fast}_{slow}_{signal}';
+        col_macd_signal = f'MACDs_{fast}_{slow}_{signal}'
+        stock_df['MACD_line'] = grouped_by_ticker['Close'].transform(
+            lambda x: ta.macd(x, fast=fast, slow=slow, signal=signal)[col_macd_line])
+        stock_df['MACD_signal'] = grouped_by_ticker['Close'].transform(
+            lambda x: ta.macd(x, fast=fast, slow=slow, signal=signal)[col_macd_signal])
 
-        # OBV (needs Close, Volume)
-        stock_df['OBV'] = stock_df.groupby(level='Ticker').apply(
-            lambda x: ta.obv(close=x['Close'], volume=x['Volume'])
-        ).reset_index(level=0, drop=True)
+        logger.debug("Calculating Bollinger Bands...")
+        bbands_cfg = bbands_config if bbands_config else {}
+        bb_len = bbands_cfg.get('length', 20);
+        bb_std = float(bbands_cfg.get('std', 2.0))
+        col_bbl = f'BBL_{bb_len}_{bb_std}';
+        col_bbm = f'BBM_{bb_len}_{bb_std}';
+        col_bbu = f'BBU_{bb_len}_{bb_std}'
+        stock_df['BB_lower'] = grouped_by_ticker['Close'].transform(
+            lambda x: ta.bbands(x, length=bb_len, std=bb_std)[col_bbl])
+        stock_df['BB_middle'] = grouped_by_ticker['Close'].transform(
+            lambda x: ta.bbands(x, length=bb_len, std=bb_std)[col_bbm])
+        stock_df['BB_upper'] = grouped_by_ticker['Close'].transform(
+            lambda x: ta.bbands(x, length=bb_len, std=bb_std)[col_bbu])
 
-        logger.info(f"Added technical indicators. Columns: {stock_df.columns.tolist()}")
+        # --- Aroon Oscillator ---
+        logger.debug("Calculating Aroon Oscillator...")
+        aroon_cfg = aroc_config if aroc_config else {}
+        aroon_len = aroon_cfg.get('length', 14)
+        aroon_osc_col = f'AROONOSC_{aroon_len}'
+
+        aroon_values_raw = grouped_by_ticker.apply(
+            lambda group: ta.aroon(high=group['High'], low=group['Low'], length=aroon_len)[aroon_osc_col].rename(None)
+        )
+        logger.debug(
+            f"Aroon: Raw aroon_values_raw. Empty: {aroon_values_raw.empty}, Index type: {type(aroon_values_raw.index)}, nlevels: {getattr(aroon_values_raw.index, 'nlevels', 'N/A')}, names: {list(aroon_values_raw.index.names)}, head:\n{aroon_values_raw.head()}")
+
+        processed_aroon_values = None
+        if not aroon_values_raw.empty and isinstance(aroon_values_raw.index, pd.MultiIndex):
+            actual_nlevels = aroon_values_raw.index.nlevels
+            actual_names = list(aroon_values_raw.index.names)
+
+            if actual_nlevels == 3 and actual_names == ['Ticker', 'Date', 'Ticker']:
+                logger.warning(
+                    f"Aroon: apply() result has 3 levels with names {actual_names}. Attempting to drop the last level (level 2).")
+                try:
+                    # The levels are (Ticker_group, Date_series, Ticker_series_index_if_present)
+                    # We want to keep the first Ticker (grouping key) and Date. Drop the 3rd.
+                    processed_aroon_values = aroon_values_raw.droplevel(2)
+                    logger.debug(
+                        f"Aroon: After dropping level 2. Index type: {type(processed_aroon_values.index)}, nlevels: {getattr(processed_aroon_values.index, 'nlevels', 'N/A')}, names: {list(processed_aroon_values.index.names)}")
+                except Exception as e_drop:
+                    logger.error(f"Aroon: Failed to drop level 2 from 3-level index: {e_drop}")
+            elif actual_nlevels == 2:
+                logger.debug("Aroon: apply() result has 2 levels as expected.")
+                processed_aroon_values = aroon_values_raw
+            else:
+                logger.error(f"Aroon: apply() result has unexpected nlevels: {actual_nlevels} or names: {actual_names}")
+        elif not aroon_values_raw.empty:
+            logger.error(
+                f"Aroon: apply() result is not a MultiIndex but not empty. Type: {type(aroon_values_raw.index)}")
+
+        if processed_aroon_values is not None and not processed_aroon_values.empty and \
+                isinstance(processed_aroon_values.index, pd.MultiIndex) and processed_aroon_values.index.nlevels == 2:
+
+            # At this point, processed_aroon_values.index should be (Ticker, Date)
+            # Set names explicitly to ensure they are correct before swapping
+            processed_aroon_values.index.set_names(['Ticker', 'Date'], inplace=True)
+
+            # Swap levels to get (Date, Ticker) for assignment
+            series_to_assign = processed_aroon_values.swaplevel('Ticker', 'Date').sort_index()
+            # series_to_assign.index is now (Date, Ticker) with names ['Date', 'Ticker']
+
+            logger.debug(
+                f"Aroon: After processing and swap. series_to_assign.index type: {type(series_to_assign.index)}, nlevels: {getattr(series_to_assign.index, 'nlevels', 'N/A')}, names: {list(series_to_assign.index.names)}")
+            stock_df[aroon_osc_col] = series_to_assign
+            logger.debug(f"Aroon oscillator '{aroon_osc_col}' assigned.")
+        else:
+            logger.error(
+                f"Aroon: Could not process aroon_values to a 2-level MI. Assigning NA. Final processed_aroon_values details: empty={processed_aroon_values is None or processed_aroon_values.empty}, nlevels={getattr(getattr(processed_aroon_values, 'index', None), 'nlevels', 'N/A')}")
+            stock_df[aroon_osc_col] = pd.NA
+
+        # --- ADX --- (Apply similar logic)
+        logger.debug("Calculating ADX...")
+        adx_cfg = adx_config if adx_config else {}
+        adx_len = adx_cfg.get('length', 14)
+        adx_col = f'ADX_{adx_len}'
+
+        adx_values_raw = grouped_by_ticker.apply(
+            lambda group: ta.adx(high=group['High'], low=group['Low'], close=group['Close'], length=adx_len)[
+                adx_col].rename(None)
+        )
+        logger.debug(
+            f"ADX: Raw adx_values_raw. Empty: {adx_values_raw.empty}, Index type: {type(adx_values_raw.index)}, nlevels: {getattr(adx_values_raw.index, 'nlevels', 'N/A')}, names: {list(adx_values_raw.index.names)}, head:\n{adx_values_raw.head()}")
+
+        processed_adx_values = None
+        if not adx_values_raw.empty and isinstance(adx_values_raw.index, pd.MultiIndex):
+            actual_nlevels_adx = adx_values_raw.index.nlevels
+            actual_names_adx = list(adx_values_raw.index.names)
+
+            if actual_nlevels_adx == 3 and actual_names_adx == ['Ticker', 'Date', 'Ticker']:
+                logger.warning(
+                    f"ADX: apply() result has 3 levels with names {actual_names_adx}. Attempting to drop the last level (level 2).")
+                try:
+                    processed_adx_values = adx_values_raw.droplevel(2)
+                    logger.debug(
+                        f"ADX: After dropping level 2. Index type: {type(processed_adx_values.index)}, nlevels: {getattr(processed_adx_values.index, 'nlevels', 'N/A')}, names: {list(processed_adx_values.index.names)}")
+                except Exception as e_drop_adx:
+                    logger.error(f"ADX: Failed to drop level 2 from 3-level index: {e_drop_adx}")
+            elif actual_nlevels_adx == 2:
+                logger.debug("ADX: apply() result has 2 levels as expected.")
+                processed_adx_values = adx_values_raw
+            else:
+                logger.error(
+                    f"ADX: apply() result has unexpected nlevels: {actual_nlevels_adx} or names: {actual_names_adx}")
+        elif not adx_values_raw.empty:
+            logger.error(f"ADX: apply() result is not a MultiIndex but not empty. Type: {type(adx_values_raw.index)}")
+
+        if processed_adx_values is not None and not processed_adx_values.empty and \
+                isinstance(processed_adx_values.index, pd.MultiIndex) and processed_adx_values.index.nlevels == 2:
+            processed_adx_values.index.set_names(['Ticker', 'Date'], inplace=True)
+            series_to_assign_adx = processed_adx_values.swaplevel('Ticker', 'Date').sort_index()
+            logger.debug(
+                f"ADX: After processing and swap. series_to_assign_adx.index type: {type(series_to_assign_adx.index)}, nlevels: {getattr(series_to_assign_adx.index, 'nlevels', 'N/A')}, names: {list(series_to_assign_adx.index.names)}")
+            stock_df[adx_col] = series_to_assign_adx
+            logger.debug(f"ADX '{adx_col}' assigned.")
+        else:
+            logger.error(
+                f"ADX: Could not process adx_values to a 2-level MI. Assigning NA. Final processed_adx_values details: empty={processed_adx_values is None or processed_adx_values.empty}, nlevels={getattr(getattr(processed_adx_values, 'index', None), 'nlevels', 'N/A')}")
+            stock_df[adx_col] = pd.NA
+
+        logger.info("Technical indicators calculation process completed.")
     except Exception as e:
         logger.error(f"Error calculating technical indicators: {e}", exc_info=True)
     return stock_df
